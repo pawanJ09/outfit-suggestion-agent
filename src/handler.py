@@ -35,7 +35,7 @@ import boto3
 # --query "modelSummaries[?contains(modelId, 'haiku')]"` before deploying.
 # Same caveat as the Style 1 version of this component; carried over
 # because I still can't verify this live from here.
-MODEL_ID = "anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 MAX_TOKENS = 300
 TEMPERATURE = 0.4
