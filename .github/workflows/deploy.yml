@@ -1,0 +1,175 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for OIDC -> AWS role assumption
+  contents: read
+
+env:
+  FUNCTION_NAME: outfit-suggestion-agent
+  ROLE_NAME: outfit-suggestion-agent-role
+  AWS_REGION: us-east-1
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Build & deploy
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build deployment package
+        run: |
+          mkdir -p build
+          cp src/handler.py build/
+          cd build && zip -r ../function.zip .
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # NOTE: this repo previously deployed outfit-suggestion-agent as a
+      # Bedrock Agent (Style 1), which created outfit-suggestion-agent-role
+      # as a Bedrock Agent *service* role -- trusting bedrock.amazonaws.com,
+      # not lambda.amazonaws.com. Bedrock Agents Classic closed to new AWS
+      # accounts on 2026-07-30, so that attempt never got past CreateAgent;
+      # but the role itself was created successfully before that failure.
+      # We're reusing the same role name on purpose (per the decision to
+      # avoid creating new AWS resources), so this step doesn't just
+      # "create if missing" like the other Lambda repos -- it actively
+      # corrects the trust policy every run, since a stale
+      # bedrock.amazonaws.com trust would make this role unusable for a
+      # Lambda (Lambda can only assume roles that trust lambda.amazonaws.com).
+      - name: Ensure execution role exists with correct Lambda trust policy
+        run: |
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME already exists (likely from the earlier Bedrock Agent attempt)."
+          else
+            echo "Role $ROLE_NAME not found — creating it."
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://iam/trust-policy.json
+            echo "New role created — waiting for IAM propagation..."
+            sleep 10
+          fi
+
+          echo "Ensuring trust policy allows lambda.amazonaws.com to assume this role..."
+          aws iam update-assume-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-document file://iam/trust-policy.json
+
+          echo "Removing the old Bedrock-Agent-era inline policy, if it's still attached..."
+          aws iam delete-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "${ROLE_NAME}-invoke-model" 2>/dev/null || true
+
+          echo "Attaching the current execution policy (logs + bedrock:InvokeModel)..."
+          aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "${ROLE_NAME}-permissions" \
+            --policy-document file://iam/execution-role-policy.json
+
+      - name: Resolve execution role ARN
+        id: role
+        run: |
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+          echo "arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy code to Lambda (create on first run, update after)
+        run: |
+          # The prompt has commas, quotes, and newlines in it, all of
+          # which break the AWS CLI's shorthand `Variables={K=V}` syntax
+          # (commas in particular are that syntax's key-value delimiter,
+          # so the prompt would get silently truncated at its first
+          # comma). Build real, properly-escaped JSON instead and pass
+          # that directly to --environment -- the CLI accepts a raw JSON
+          # string for any structured parameter, not just shorthand.
+          ENV_JSON=$(python3 -c "
+          import json
+          with open('config/instructions.txt') as f:
+              text = f.read()
+          print(json.dumps({'Variables': {'OUTFIT_INSTRUCTIONS': text}}))
+          ")
+
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "Function $FUNCTION_NAME already exists — updating code and config."
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://function.zip \
+              --publish
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --environment "$ENV_JSON"
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+          else
+            echo "Function $FUNCTION_NAME not found — creating it."
+            for attempt in 1 2 3 4 5; do
+              if aws lambda create-function \
+                  --function-name "$FUNCTION_NAME" \
+                  --runtime python3.14 \
+                  --handler handler.lambda_handler \
+                  --role "${{ steps.role.outputs.arn }}" \
+                  --zip-file fileb://function.zip \
+                  --timeout 15 \
+                  --memory-size 128 \
+                  --environment "$ENV_JSON" \
+                  --publish; then
+                break
+              fi
+              echo "create-function failed (role may not have propagated yet) — retrying in 10s [$attempt/5]"
+              sleep 10
+            done
+            aws lambda wait function-active --function-name "$FUNCTION_NAME"
+          fi
+
+  validate:
+    name: Smoke-test the deployed function
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Invoke deployed Lambda with sample request
+        run: |
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file://events/sample_event_direct.json \
+            response.json
+          echo "--- raw response ---"
+          cat response.json
+
+      - name: Assert the response was successful
+        run: |
+          STATUS=$(jq -r '.statusCode' response.json)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Deployed Lambda did not return 200 (got: $STATUS)"
+            exit 1
+          fi
+          BODY_HAS_REC=$(jq -r '.body' response.json | jq -r 'has("recommendation")')
+          if [ "$BODY_HAS_REC" != "true" ]; then
+            echo "::error::Response body is missing recommendation"
+            exit 1
+          fi
+          echo "✅ Deployed Lambda responded successfully"
+          echo "--- recommendation ---"
+          jq -r '.body' response.json | jq -r '.recommendation'

@@ -1,0 +1,4 @@
+# No packaged runtime dependencies. handler.py imports boto3, but boto3
+# ships preinstalled in every AWS Lambda Python runtime -- it does not
+# need to be vendored into the deployment zip. The deployment package is
+# still just handler.py, same as the two weather Lambdas.
